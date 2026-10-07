@@ -72,6 +72,9 @@ button,select{font:inherit;color:inherit}
 .seg button+button{border-left:1.5px solid var(--ink)}
 .seg button[aria-pressed="true"]{background:var(--ink);color:var(--surface)}
 .field{display:flex;flex-direction:column;gap:4px;flex:1 1 280px;min-width:0}
+.field.fdept{flex:0 1 340px}
+.warn{margin:12px 2px 0;padding:10px 14px;border:1.5px solid #B7791F;border-left-width:6px;border-radius:3px;background:var(--surface);color:var(--ink);font-size:14px}
+.warn b{font-weight:700}
 .field>span{font-size:13px;color:var(--ink2);font-weight:600}
 .field select{width:100%;min-height:44px;padding:8px 12px;border:1.5px solid var(--ink);border-radius:4px;background:var(--surface);appearance:auto}
 .export{position:relative;margin-left:auto}
@@ -206,6 +209,7 @@ table.grid{border-collapse:collapse;width:100%;table-layout:fixed;font-family:"B
   .brand h1{font-size:22px} .brand img{height:40px}
   .controls{padding:12px}
   .seg{width:100%}.seg button{flex:1}
+  .field.fdept{flex:1 1 100%}
   .export{margin-left:0;width:100%}.export .btn{width:100%;justify-content:center}
   .menu{left:0;right:0}
   .sheet:not(.xp) .tt .tablewrap{display:none}
@@ -240,6 +244,9 @@ table.grid{border-collapse:collapse;width:100%;table-layout:fixed;font-family:"B
       <button type="button" id="segTeacher" aria-pressed="true">Teacher</button>
       <button type="button" id="segStudent" aria-pressed="false">Student</button>
     </div>
+    <label class="field fdept"><span>Department</span>
+      <select id="dept" disabled><option>Loading…</option></select>
+    </label>
     <label class="field"><span id="pickLabel">Teacher</span>
       <select id="pick" disabled><option>Loading…</option></select>
     </label>
@@ -334,15 +341,18 @@ function buildModel(data, sel) {
   var courses = data.courses || {};
   var dayOrder = (data.meta && data.meta.dayOrder) || ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
+  var multi = ((data.meta && data.meta.departments) || []).length > 1;
+  var tKey = String(sel.key || '').toUpperCase();
+  if (sel.mode === 'teacher') { var ti = teacherInfo(data, sel.key); if (ti) tKey = ti.acr.toUpperCase(); }
   var picked = data.entries.filter(function (e) {
     return sel.mode === 'teacher'
-      ? (e.teacher && e.teacher.toUpperCase() === String(sel.key).toUpperCase())
+      ? (e.teacher && e.teacher.toUpperCase() === tKey)       // every department's sheets, so one teacher gets ONE routine
       : (e.sheet === sel.sheet && e.batch === sel.batch);
   });
 
   // 1 · one item per class; in the teacher view the same course + room in several batches becomes one JOINT class
   var items = picked.map(function (e) {
-    return { sheet: e.sheet, day: e.day, code: e.code, teacher: e.teacher, room: e.room, batches: [e.batch],
+    return { sheet: e.sheet, dept: e.dept || '', day: e.day, code: e.code, teacher: e.teacher, room: e.room, batches: [e.batch],
              slots: e.slots.map(function (s) { return [s[0], s[1]]; }),
              start: e.slots[0][0], end: e.slots[e.slots.length - 1][1] };
   });
@@ -366,6 +376,7 @@ function buildModel(data, sel) {
     items.forEach(function (it) { it.batches.sort(); it.joint = it.batches.length > 1; if (it.joint) jointCount++; });
   } else { items.forEach(function (it) { it.joint = false; }); }
 
+  items.forEach(function (it) { it.batchText = (multi && it.dept ? it.dept + ' ' : '') + it.batches.join(' & '); });
   var hues = assignHues(items.map(function (i) { return i.code; }), courses);
   items.forEach(function (it) {
     var c = courses[it.code] || {};
@@ -424,14 +435,21 @@ function buildModel(data, sel) {
     if (bl.length) rows.push({ day: day, blocks: bl });
   });
 
-  var codes = {}; items.forEach(function (it) { codes[it.code] = it; });
+  var codes = {}, depts = [], missing = {};
+  items.forEach(function (it) { codes[it.code] = it; if (it.dept && depts.indexOf(it.dept) < 0) depts.push(it.dept); if (!it.title) missing[it.code] = 1; });
+  var seenTag = {}, tags = [];
+  data.sheets.forEach(function (s) {
+    if (s.tag && !seenTag[s.tag] && items.some(function (it) { return it.tag === s.tag; })) { seenTag[s.tag] = 1; tags.push({ tag: s.tag, label: s.label }); }
+  });
   return {
+    depts: depts,
+    missing: Object.keys(missing).sort(),
     cols: cols.map(function (c, i) { return { n: i + 1, s: c.s, e: c.e }; }),
     rows: rows,
     sessions: items.length,
     jointCount: jointCount,
     legend: Object.keys(codes).sort().map(function (c) { var it = codes[c]; return { code: c, title: it.title || c, sess: it.sess, hue: it.hue }; }),
-    tags: data.sheets.filter(function (s) { return s.tag; }).map(function (s) { return { tag: s.tag, label: s.label }; }),
+    tags: tags,
     sheetLabel: sheetLabel
   };
 }
@@ -471,36 +489,47 @@ function courseTeachers(data, model) {
 }
 
 /* Header text, notes and (student) teacher table: shared by the page, PDF/JPG, Word and Excel */
+function programFor(data, dept) {
+  var d = (((data.meta || {}).departments) || []).filter(function (x) { return x.code === dept; })[0];
+  return d ? d.program : (dept ? 'B.Sc. in ' + dept : '');
+}
 function describe(data, sel, model) {
   var m = data.meta || {}, term = String(m.term || '').replace(/\s+/g, '-');
-  var dept = m.departmentShort || m.department || '';
-  var left = [['Department', dept]], right = [], who, teachers = null;
-  if (m.program) left.push(['Program', m.program]);
+  var left = [], right = [], who, teachers = null;
   var plural = model.sessions + ' sessions a week' + (model.jointCount ? ' (joint classes counted once)' : '');
   if (sel.mode === 'teacher') {
     var t = teacherInfo(data, sel.key) || { acr: sel.key, name: '' };
     who = teacherLabel(t);
-    left.push(['Semester', term]); left.push(['Classes', plural]);
+    var home = t.home || model.depts[0] || '', others = model.depts.filter(function (x) { return x !== home; });
+    left.push(['Department', home]);
+    if (home) left.push(['Program', programFor(data, home)]);
+    left.push(['Semester', term]);
+    if (others.length) left.push(['Also teaches in', others.join(', ')]);
+    left.push(['Classes', plural]);
     right.push(['Course Teacher', who]);
     if (t.designation) right.push(['Designation', t.designation]);
     if (t.affiliation) right.push(['Department', t.affiliation]);
     if (t.phone) right.push(['Cell', t.phone]);
   } else {
-    who = (model.sheetLabel[sel.sheet] || sel.sheet) + ' ' + sel.batch;
+    var sh = data.sheets.filter(function (x) { return x.key === sel.sheet; })[0] || {};
+    who = (sh.label || sel.sheet) + ' ' + sel.batch;
     teachers = courseTeachers(data, model);
     var tn = {}; teachers.forEach(function (c) { c.teachers.forEach(function (x) { tn[x.acr] = 1; }); });
+    left.push(['Department', sh.dept || '']);
+    if (sh.dept) left.push(['Program', programFor(data, sh.dept)]);
     left.push(['Semester', semesterName(sel.batch)]); left.push(['Classes', plural]);
     right.push(['Batch', who]); right.push(['Enrollment Semester', term]);
     right.push(['Courses', String(teachers.length)]); right.push(['Course Teachers', String(Object.keys(tn).length)]);
   }
   var notes = ['Periods group classes whose time frames overlap or are close; the exact time of every class is printed in its cell. A class that runs across several periods is one wide cell.'];
   if (model.jointCount) notes.push('Joint class: the routine lists the same course in the same room under more than one batch, so it is shown once with all its batches.');
+  if (sel.mode === 'teacher' && model.depts.length > 1) notes.push('This routine combines the classes of every department this teacher is assigned to; each batch is marked with its department.');
   (m.notes || []).forEach(function (n) { notes.push(n); });
   return { org: m.institution || '', docTitle: 'Class Routine', left: left, right: right, notes: notes, who: who, teachers: teachers };
 }
 
 function metaLine(it, mode, data) {                        // "Batch 2-2 & 3-1"  or  "Teacher AAR"
-  if (mode === 'teacher') return { k: it.batches.length > 1 ? 'Batches' : 'Batch', v: it.batches.join(' & ') };
+  if (mode === 'teacher') return { k: it.batches.length > 1 ? 'Batches' : 'Batch', v: it.batchText || it.batches.join(' & ') };
   var t = it.teacher ? teacherInfo(data, it.teacher) : null;
   return { k: 'Teacher', v: it.teacher || '—', full: t && t.name ? t.name : '' };
 }
@@ -521,7 +550,7 @@ function entryHTML(it, mode, data) {
   return '<div class="entry' + (it.sess ? ' sess' : '') + '" style="' + hs(it.hue) + '">' + tags +
     '<div class="time">' + esc(fmtRange(it.start, it.end)).replace('–', '–<wbr>') + '</div>' +
     '<div class="dl"><span class="dur">' + esc(fmtDur(it.dur)) + '</span>' + barHTML(it) + '</div>' +
-    '<div class="title">' + esc(it.title || it.code) + '</div>' +
+    (it.title ? '<div class="title">' + esc(it.title) + '</div>' : '') +
     '<div class="code">' + esc(it.code) + '</div>' +
     '<div class="mr"><span class="meta"' + tl + '>' + esc(ml.k) + ' <b>' + esc(ml.v) + '</b></span><span class="meta">Room <b>' + esc(it.room || '—') + '</b></span></div></div>';
 }
@@ -545,7 +574,7 @@ function teachersHTML(d, cols) {
   var tel = function (p) { return p ? '<a href="tel:' + esc(p.replace(/[^\d+]/g, '')) + '">' + esc(p) + '</a>' : ''; };
   var rows = d.teachers.map(function (c) {
     var tl = c.teachers.length ? c.teachers : [{ acr: '', name: '—' }];
-    return '<tr style="' + hs(c.hue) + '"><td class="tc">' + esc(c.code) + '</td><td>' + esc(c.title || c.code) + (c.credit ? ' <span class="cr">(' + c.credit + ' cr)</span>' : '') + '</td>' +
+    return '<tr style="' + hs(c.hue) + '"><td class="tc">' + esc(c.code) + '</td><td>' + (c.title ? esc(c.title) : '<span class="cr">title not found</span>') + (c.credit ? ' <span class="cr">(' + c.credit + ' cr)</span>' : '') + '</td>' +
       '<td class="tp">' + tl.map(function (t) { var sub = [t.designation, t.affiliation].filter(Boolean).join(', ');
         return '<div><b>' + esc(t.name || t.acr) + '</b>' + (sub ? '<span>' + esc(sub) + '</span>' : '') + '</div>'; }).join('') + '</td>' +
       '<td class="th">' + tl.map(function (t) { return '<div>' + esc(t.phone || '') + '</div>'; }).join('') + '</td></tr>';
@@ -554,7 +583,7 @@ function teachersHTML(d, cols) {
   var table = function (r) { return '<table><thead><tr><th>Code</th><th>Course</th><th>Teacher</th><th>Cell</th></tr></thead><tbody>' + r.join('') + '</tbody></table>'; };
   var cards = d.teachers.map(function (c) {
     var tl = c.teachers.length ? c.teachers : [{ acr: '', name: '—' }];
-    return '<div class="tc" style="' + hs(c.hue) + '"><b>' + esc(c.code) + ' · ' + esc(c.title || '') + '</b>' + tl.map(function (t) {
+    return '<div class="tc" style="' + hs(c.hue) + '"><b>' + esc(c.code) + (c.title ? ' · ' + esc(c.title) : '') + '</b>' + tl.map(function (t) {
       var sub = [t.designation, t.affiliation].filter(Boolean).join(', ');
       return '<span>' + esc(t.name || t.acr) + (sub ? ', ' + esc(sub) : '') + (t.phone ? ' · ' + tel(t.phone) : '') + '</span>'; }).join('') + '</div>';
   }).join('');
@@ -608,8 +637,29 @@ function b64bytes(b64) { var s = atob(b64), a = new Uint8Array(s.length); for (v
 async function buildDocx(docxLib, model, d, mode, data, barPng, logoB64) {
   var D = docxLib, FONT = 'Arial', NAVY = '1F2A44';
   var N = model.cols.length, hasTT = !!(d.teachers && d.teachers.length);
-  var DAYW = 1000, TW = 15838, PW = Math.floor((TW - DAYW) / N);
+  var DAYW = 1000, TW = 15838, PW = Math.floor((TW - DAYW) / N), LIMIT = 10700;
   var base = hasTT ? (N >= 10 ? 12 : 13) : (N >= 10 ? 13 : N >= 7 ? 15 : 17);
+  // keep it to ONE page: estimate the height (text wrapping included) and step the text down when a routine is
+  // unusually tall, for example a teacher with several classes stacked in the same period
+  var estimate = function (b) {
+    var lh = b * 11.5, PWd = Math.floor((TW - DAYW) / N), rowsH = 0;
+    model.rows.forEach(function (r) {
+      var mx = 0;
+      r.blocks.forEach(function (x) {
+        var span = x.c1 - x.c0 + 1, cpl = Math.max(4, Math.floor((PWd * span - 110) / (b * 6.1))), lines = 0;
+        x.items.forEach(function (it, i) {
+          var tl = it.title ? Math.ceil(it.title.length / cpl) : 0;
+          lines += 6.85 + tl + (i ? 0.6 : 0);
+        });
+        mx = Math.max(mx, lines);
+      });
+      rowsH += mx * lh + 60;
+    });
+    var tt = 0;
+    if (hasTT) tt = 260 + Math.ceil(d.teachers.length / 2) * (2 * Math.min(12, b) * 11.5 + 30);
+    return rowsH + 1000 + 30 + 430 + 380 + d.notes.length * 140 + tt;
+  };
+  while (base > 9 && estimate(base) > LIMIT) base--;
   var line = { style: D.BorderStyle.SINGLE, size: 4, color: '9AA5B5' }, borders = { top: line, bottom: line, left: line, right: line };
   var none = { style: D.BorderStyle.NONE, size: 0, color: 'FFFFFF' }, noBorders = { top: none, bottom: none, left: none, right: none };
   var run = function (t, o) { o = o || {}; return new D.TextRun({ text: t, font: FONT, size: o.size || base, bold: o.bold, color: o.color, italics: o.italics, underline: o.underline ? {} : undefined,
@@ -652,7 +702,7 @@ async function buildDocx(docxLib, model, d, mode, data, barPng, logoB64) {
       para([run(fmtRange(it.start, it.end), { bold: true, size: base + 1 })], center, ex()),
       para([run(fmtDur(it.dur), { bold: true, color: '374151' })], center, ex({ spacing: sp(0, 0) })),
       para([new D.ImageRun({ type: 'png', data: bar.data, transformation: { width: bar.n * 56, height: 7 }, altText: { title: 'Duration', description: fmtDur(it.dur), name: 'bar' } })], center, ex({ spacing: sp(10, 10) })),
-      para([run(it.title || it.code, { bold: true, color: col.fg })], center, ex()),
+      para([run(it.title || '\u00A0', { bold: true, color: col.fg })], center, ex()),
       para([run(it.code, { bold: true })], center, ex()),
       para([run(ml.k + ' ', { color: '374151' }), run(ml.v, { bold: true })], center, ex()),
       para([run('Room ', { color: '374151' }), run(it.room || '—', { bold: true })], center, ex())
@@ -683,7 +733,7 @@ async function buildDocx(docxLib, model, d, mode, data, barPng, logoB64) {
   var out = [hdr, para([run('')], null, { spacing: { before: 0, after: 40 } }), table, para(chips, D.AlignmentType.LEFT, { spacing: { before: 50, after: 40 } })];
 
   if (hasTT) {                                           // course teachers, two columns of courses side by side
-    var tsz = 12, half = Math.ceil(d.teachers.length / 2);
+    var tsz = Math.min(12, base), half = Math.ceil(d.teachers.length / 2);
     var W = [1000, 2750, 2600, 1100], tw = W.reduce(function (a, b) { return a + b; }, 0), GAP = TW - 2 * tw;
     var tcell = function (kids, w, o) { o = o || {}; return new D.TableCell({ children: kids, width: { size: w, type: D.WidthType.DXA }, borders: o.plain ? noBorders : { top: none, left: none, right: none, bottom: line }, margins: { top: 10, bottom: 10, left: 40, right: 40 },
       shading: o.fill ? { type: D.ShadingType.CLEAR, fill: o.fill, color: 'auto' } : undefined }); };
@@ -692,7 +742,7 @@ async function buildDocx(docxLib, model, d, mode, data, barPng, logoB64) {
       var tp = tl.map(function (t) { var sub = [t.designation, t.affiliation].filter(Boolean).join(', ');
         return para([run(t.name || t.acr, { bold: true, size: tsz }), run(sub ? ', ' + sub : '', { size: tsz - 1, color: '4B5563' })]); });
       return [tcell([para([run(c.code, { bold: true, size: tsz, color: col.fg })])], W[0], { fill: c.sess ? col.bgS : col.bg }),
-        tcell([para([run(c.title || c.code, { size: tsz }), run(c.credit ? ' (' + c.credit + ' cr)' : '', { size: tsz - 1, color: '4B5563' })])], W[1]),
+        tcell([para([run(c.title || 'title not found', { size: tsz }), run(c.credit ? ' (' + c.credit + ' cr)' : '', { size: tsz - 1, color: '4B5563' })])], W[1]),
         tcell(tp, W[2]),
         tcell(tl.map(function (t) { return para([run(t.phone || '', { size: tsz })]); }), W[3])];
     };
@@ -759,7 +809,7 @@ async function buildXlsx(ExcelJS, model, d, mode, data, logoB64) {
         rich.push(t(fmtRange(it.start, it.end) + '\n', { bold: true, size: 10 }));
         rich.push(t(fmtDur(it.dur) + '\n', { bold: true }));
         rich.push(t(barText(it.dur) + '\n', { color: { argb: 'FF' + col.bar }, size: 8 }));
-        rich.push(t((it.title || it.code) + '\n', { bold: true }));
+        if (it.title) rich.push(t(it.title + '\n', { bold: true }));
         rich.push(t(it.code + '\n', { bold: true }));
         rich.push(t(ml.k + ' ' + ml.v + '\n'));
         rich.push(t('Room ' + (it.room || '—')));
@@ -794,7 +844,7 @@ async function buildXlsx(ExcelJS, model, d, mode, data, logoB64) {
     place(rowNo, ['Code', 'Course', 'Teacher', 'Cell'], true); rowNo++;
     d.teachers.forEach(function (cr) {
       var tl = cr.teachers.length ? cr.teachers : [{ acr: '', name: '—' }];
-      place(rowNo, [cr.code, (cr.title || cr.code) + (cr.credit ? ' (' + cr.credit + ' cr)' : ''),
+      place(rowNo, [cr.code, (cr.title || 'title not found') + (cr.credit ? ' (' + cr.credit + ' cr)' : ''),
         tl.map(function (t) { return (t.name || t.acr) + ([t.designation, t.affiliation].filter(Boolean).length ? ', ' + [t.designation, t.affiliation].filter(Boolean).join(', ') : ''); }).join('\n'),
         tl.map(function (t) { return t.phone || ''; }).join('\n')], false, cr.hue, cr.sess);
       ws.getRow(rowNo).height = 13 * Math.max(1, tl.length) + 4; rowNo++;
@@ -822,8 +872,8 @@ async function buildXlsx(ExcelJS, model, d, mode, data, logoB64) {
 
 /* ═════════════ 5 · App ═════════════ */
 var $ = function (id) { return document.getElementById(id); };
-var state = { data: null, mode: 'teacher', teacher: '', batch: '', model: null, desc: null, sel: null };
-var KEY = { data: 'routine:data2', ui: 'routine:ui', theme: 'routine:theme' };
+var state = { data: null, mode: 'teacher', dept: '', teacher: '', batch: '', model: null, desc: null, sel: null };
+var KEY = { data: 'routine:data3', ui: 'routine:ui', theme: 'routine:theme' };
 var store = {
   get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
   set: function (k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
@@ -904,28 +954,39 @@ function showError(msg) {
 }
 
 /* ---- pickers ---- */
+function deptList() { return (state.data && state.data.meta.departments) || []; }
 function setupPickers() {
-  var d = state.data, sel = $('pick');
-  $('termLine').textContent = [d.meta.departmentShort || (d.meta.department || '').replace(/^Department of /, ''), d.meta.term].filter(Boolean).join(' – ');
-  document.title = 'Class routine – ' + (d.meta.term || '');
+  var d = state.data, sel = $('pick'), dsel = $('dept'), dd = deptList(), all = state.dept === '*';
+  if (!all && !dd.some(function (x) { return x.code === state.dept; })) state.dept = dd.length ? dd[0].code : '*';
+  all = state.dept === '*';
+  dsel.innerHTML = (dd.length > 1 ? '<option value="*"' + (all ? ' selected' : '') + '>All departments</option>' : '') +
+    dd.map(function (x) { return '<option value="' + esc(x.code) + '"' + (x.code === state.dept ? ' selected' : '') + '>' + esc(x.code + (x.name ? ' – ' + x.name : '')) + '</option>'; }).join('');
+  dsel.disabled = false;
+  $('termLine').textContent = [all ? 'All departments' : state.dept, d.meta.term].filter(Boolean).join(' – ');
+  document.title = 'Class routine – ' + (all ? '' : state.dept + ' ') + (d.meta.term || '');
   var html;
   if (state.mode === 'teacher') {
     $('pickLabel').textContent = 'Teacher';
-    var ts = d.teachers.slice().sort(function (a, b) { var x = sortKey(a), y = sortKey(b); return x < y ? -1 : x > y ? 1 : 0; });
+    var inDept = function (t) { return all || (t.depts || []).indexOf(state.dept) >= 0 || t.home === state.dept; };
+    var ts = d.teachers.filter(inDept).sort(function (a, b) { var x = sortKey(a), y = sortKey(b); return x < y ? -1 : x > y ? 1 : 0; });
+    if (state.teacher && !ts.some(function (t) { return t.acr === state.teacher; })) { var cur = teacherInfo(d, state.teacher); if (cur && ts.some(function (t) { return t.acr === cur.acr; })) state.teacher = cur.acr; else state.teacher = ''; }
     html = '<option value="">Choose a teacher…</option>' + ts.map(function (t) {
-      return '<option value="' + esc(t.acr) + '"' + (t.acr === state.teacher ? ' selected' : '') + '>' + esc(teacherLabel(t)) + '</option>';
+      return '<option value="' + esc(t.acr) + '"' + (t.acr === state.teacher ? ' selected' : '') + '>' + esc(teacherLabel(t) + (all && t.depts && t.depts.length ? ' – ' + t.depts.join(', ') : '')) + '</option>';
     }).join('');
   } else {
     $('pickLabel').textContent = 'Batch';
     html = '<option value="">Choose your batch…</option>';
+    var valid = false;
     d.sheets.forEach(function (s) {
+      if (!all && s.dept !== state.dept) return;
       var opts = d.batches.filter(function (b) { return b.sheet === s.key; });
       if (!opts.length) return;
-      html += '<optgroup label="' + esc(s.label) + '">' + opts.map(function (b) {
-        var v = b.sheet + '|' + b.batch;
-        return '<option value="' + esc(v) + '"' + (v === state.batch ? ' selected' : '') + '>' + esc(b.label) + '</option>';
+      html += '<optgroup label="' + esc((all ? s.dept + ' ' : '') + s.label) + '">' + opts.map(function (b) {
+        var v = b.sheet + '|' + b.batch; if (v === state.batch) valid = true;
+        return '<option value="' + esc(v) + '"' + (v === state.batch ? ' selected' : '') + '>' + esc((all ? b.dept + ' ' : '') + b.label) + '</option>';
       }).join('') + '</optgroup>';
     });
+    if (!valid) state.batch = '';
   }
   sel.innerHTML = html; sel.disabled = false;
   $('segTeacher').setAttribute('aria-pressed', String(state.mode === 'teacher'));
@@ -937,20 +998,28 @@ function setMode(m) {
 }
 $('segTeacher').addEventListener('click', function () { setMode('teacher'); });
 $('segStudent').addEventListener('click', function () { setMode('student'); });
+$('dept').addEventListener('change', function () { state.dept = this.value; setupPickers(); saveUI(); render(); });
 $('pick').addEventListener('change', function () {
   if (state.mode === 'teacher') state.teacher = this.value; else state.batch = this.value;
   saveUI(); render();
 });
 function saveUI() {
-  store.set(KEY.ui, JSON.stringify({ mode: state.mode, teacher: state.teacher, batch: state.batch }));
-  var h = state.mode === 'teacher' ? (state.teacher ? '#t=' + encodeURIComponent(state.teacher) : '') : (state.batch ? '#s=' + encodeURIComponent(state.batch) : '');
-  try { history.replaceState(null, '', location.pathname + location.search + h); } catch (e) { /* file:// */ }
+  store.set(KEY.ui, JSON.stringify({ mode: state.mode, dept: state.dept, teacher: state.teacher, batch: state.batch }));
+  var q = [];
+  if (state.dept) q.push('d=' + encodeURIComponent(state.dept));
+  if (state.mode === 'teacher' && state.teacher) q.push('t=' + encodeURIComponent(state.teacher));
+  if (state.mode === 'student' && state.batch) q.push('s=' + encodeURIComponent(state.batch));
+  try { history.replaceState(null, '', location.pathname + location.search + (q.length ? '#' + q.join('&') : '')); } catch (e) { /* file:// */ }
 }
 function restoreUI() {
-  try { var u = JSON.parse(store.get(KEY.ui) || '{}'); state.mode = u.mode === 'student' ? 'student' : 'teacher'; state.teacher = u.teacher || ''; state.batch = u.batch || ''; } catch (e) { /* ignore */ }
+  try { var u = JSON.parse(store.get(KEY.ui) || '{}'); state.mode = u.mode === 'student' ? 'student' : 'teacher'; state.dept = u.dept || ''; state.teacher = u.teacher || ''; state.batch = u.batch || ''; } catch (e) { /* ignore */ }
   var h = location.hash.replace(/^#/, '');                      // a shared link wins over the saved choice
-  var m = h.match(/^([ts])=(.*)$/);
-  if (m) { if (m[1] === 't') { state.mode = 'teacher'; state.teacher = decodeURIComponent(m[2]); } else { state.mode = 'student'; state.batch = decodeURIComponent(m[2]); } }
+  if (h) {
+    var q = {}; h.split('&').forEach(function (kv) { var i = kv.indexOf('='); if (i > 0) { try { q[kv.slice(0, i)] = decodeURIComponent(kv.slice(i + 1)); } catch (e) { /* skip */ } } });
+    if (q.d) state.dept = q.d;
+    if (q.t) { state.mode = 'teacher'; state.teacher = q.t; }
+    else if (q.s) { state.mode = 'student'; state.batch = q.s; }
+  }
 }
 
 /* ---- render ---- */
@@ -976,7 +1045,8 @@ function render() {
   }
   var desc = describe(d, sel, model);
   state.model = model; state.desc = desc;
-  stage.innerHTML = sheetHTML(model, desc, sel.mode, d, { cards: narrow.matches });
+  stage.innerHTML = sheetHTML(model, desc, sel.mode, d, { cards: narrow.matches }) +
+    (model.missing.length ? '<p class="warn"><b>Course title missing</b> for ' + esc(model.missing.join(', ')) + '. Add the code (column E) and title (column F) to the Teacher sheet; the code is shown until then.</p>' : '');
   $('exportBtn').disabled = false;
 }
 narrow.addEventListener ? narrow.addEventListener('change', render) : narrow.addListener(render);
